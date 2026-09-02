@@ -1,0 +1,5 @@
+关屏不待机.app/
+*.zip
+AppIcon.iconset/
+.DS_Store
+.autocode/
