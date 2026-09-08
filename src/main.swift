@@ -8,6 +8,18 @@ import ApplicationServices
 // 2) 状态栏面板:左键点菜单栏图标,弹出面板列出所有 app 的状态栏项(含被刘海/溢出挤掉的),
 //    点一项 = 通过辅助功能接口「按」那个状态栏项。需要「辅助功能」权限。
 
+// MARK: 日志(~/Library/Logs/ScreenOff.log)
+enum Log {
+    static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/ScreenOff.log")
+    static func w(_ msg: String) {
+        let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
+        let line = "\(f.string(from: Date())) \(msg)\n"
+        NSLog("%@", msg)
+        if let h = try? FileHandle(forWritingTo: url) { h.seekToEndOfFile(); h.write(line.data(using: .utf8)!); h.closeFile() }
+        else { try? line.write(to: url, atomically: true, encoding: .utf8) }
+    }
+}
+
 // MARK: 亮度(私有 API,取不到就跳过)
 enum Brightness {
     private typealias GetFn = @convention(c) (CGDirectDisplayID, UnsafeMutablePointer<Float>) -> Int32
@@ -33,6 +45,134 @@ final class BlackWindow: NSWindow {
     override func mouseMoved(with event: NSEvent) {}
 }
 
+
+// MARK: 状态栏项窗口(截图用)与事件合成
+struct StatusWindow { let id: CGWindowID; let pid: pid_t; let bounds: CGRect }
+
+enum StatusWindows {
+    /// 所有状态栏层(layer 25)的窗口,含被刘海挡住的
+    static func all() -> [StatusWindow] {
+        guard let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] else { return [] }
+        var out: [StatusWindow] = []
+        for w in list {
+            guard (w[kCGWindowLayer as String] as? Int) == 25,
+                  let id = w[kCGWindowNumber as String] as? CGWindowID,
+                  let pid = w[kCGWindowOwnerPID as String] as? pid_t,
+                  let b = w[kCGWindowBounds as String] as? [String: CGFloat] else { continue }
+            let r = CGRect(x: b["X"] ?? 0, y: b["Y"] ?? 0, width: b["Width"] ?? 0, height: b["Height"] ?? 0)
+            guard r.minY == 0, r.height <= 40, r.width < 400 else { continue }
+            out.append(StatusWindow(id: id, pid: pid, bounds: r))
+        }
+        return out
+    }
+    static var hasPermission: Bool { CGPreflightScreenCaptureAccess() }
+    static func requestPermission() { CGRequestScreenCaptureAccess() }
+    /// 截取某个状态栏项窗口的图像(需要屏幕录制权限)
+    // CGWindowListCreateImage 在 SDK 里标成不可用,但系统里仍在,用 dlsym 取
+    private typealias CreateImageFn = @convention(c) (CGRect, UInt32, UInt32, UInt32) -> Unmanaged<CGImage>?
+    private static let createImage: CreateImageFn? = {
+        guard let h = dlopen("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics", RTLD_NOW),
+              let p = dlsym(h, "CGWindowListCreateImage") else { return nil }
+        return unsafeBitCast(p, to: CreateImageFn.self)
+    }()
+    static func image(of w: StatusWindow) -> NSImage? {
+        // kCGWindowListOptionIncludingWindow = 1<<3; kCGWindowImageBoundsIgnoreFraming = 1<<0, kCGWindowImageBestResolution = 1<<3
+        guard let f = createImage, let cg = f(.null, 1 << 3, w.id, (1 << 0) | (1 << 3))?.takeRetainedValue() else { return nil }
+        guard cg.width > 1, cg.height > 1 else { return nil }
+        return NSImage(cgImage: cg, size: w.bounds.size)
+    }
+    /// 图像里不透明像素的平均亮度(判断菜单栏是深色还是浅色)
+    static func luminance(_ img: NSImage) -> CGFloat? {
+        guard let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff) else { return nil }
+        var sum: CGFloat = 0, n = 0
+        let stepX = max(1, rep.pixelsWide / 40), stepY = max(1, rep.pixelsHigh / 20)
+        var y = 0
+        while y < rep.pixelsHigh {
+            var x = 0
+            while x < rep.pixelsWide {
+                if let c = rep.colorAt(x: x, y: y), c.alphaComponent > 0.5 {
+                    sum += 0.299 * c.redComponent + 0.587 * c.greenComponent + 0.114 * c.blueComponent; n += 1
+                }
+                x += stepX
+            }
+            y += stepY
+        }
+        return n == 0 ? nil : sum / CGFloat(n)
+    }
+}
+
+enum Synth {
+    private static func post(_ type: CGEventType, _ p: CGPoint, button: CGMouseButton = .left, flags: CGEventFlags = []) {
+        guard let e = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: p, mouseButton: button) else { return }
+        e.flags = flags
+        e.post(tap: .cghidEventTap)
+    }
+    static var lastSeen = ""
+    /// 在真实菜单栏位置点一下(左键或右键),然后把光标放回原处
+    static func click(at p: CGPoint, right: Bool = false) {
+        let origin = NSEvent.mouseLocation
+        let restore = CGPoint(x: origin.x, y: (NSScreen.screens.first?.frame.height ?? 0) - origin.y)
+        let btn: CGMouseButton = right ? .right : .left
+        post(.mouseMoved, p)
+        usleep(40_000)
+        let m = NSEvent.mouseLocation; lastSeen = "\(Int(m.x)),\(Int(m.y))"
+        post(right ? .rightMouseDown : .leftMouseDown, p, button: btn)
+        usleep(60_000)
+        post(right ? .rightMouseUp : .leftMouseUp, p, button: btn)
+        usleep(80_000)
+        CGWarpMouseCursorPosition(restore)
+    }
+    /// ⌘拖动:把状态栏项从 from 拖到 to
+    static func cmdDrag(from: CGPoint, to: CGPoint) {
+        let origin = NSEvent.mouseLocation
+        let restore = CGPoint(x: origin.x, y: (NSScreen.screens.first?.frame.height ?? 0) - origin.y)
+        post(.mouseMoved, from)
+        usleep(60_000)
+        post(.leftMouseDown, from, flags: .maskCommand)
+        usleep(120_000)
+        let steps = 20
+        for i in 1...steps {
+            let t = CGFloat(i) / CGFloat(steps)
+            let p = CGPoint(x: from.x + (to.x - from.x) * t, y: from.y)
+            post(.leftMouseDragged, p, flags: .maskCommand)
+            usleep(15_000)
+        }
+        usleep(120_000)
+        post(.leftMouseUp, to, flags: .maskCommand)
+        usleep(150_000)
+        CGWarpMouseCursorPosition(restore)
+    }
+}
+
+// MARK: 图标缓存:在可见区截到过一次就存下来,被刘海挡住时照样能显示原样
+enum IconCache {
+    private static var mem: [String: NSImage] = [:]
+    private static let dir: URL = {
+        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("ScreenOff/icons")
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }()
+    static func key(_ app: NSRunningApplication, _ label: String, _ width: CGFloat) -> String {
+        let raw = "\(app.bundleIdentifier ?? app.localizedName ?? "?")|\(label)|\(Int(width))"
+        return raw.map { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" ? String($0) : "_" }.joined()
+    }
+    static func get(_ k: String) -> NSImage? {
+        if let m = mem[k] { return m }
+        let f = dir.appendingPathComponent(k + ".png")
+        guard let img = NSImage(contentsOf: f) else { return nil }
+        mem[k] = img
+        return img
+    }
+    static func put(_ k: String, _ img: NSImage) {
+        mem[k] = img
+        let f = dir.appendingPathComponent(k + ".png")
+        if FileManager.default.fileExists(atPath: f.path) { return }
+        guard let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff),
+              let png = rep.representation(using: .png, properties: [:]) else { return }
+        try? png.write(to: f)
+    }
+}
+
 // MARK: 状态栏项(辅助功能枚举)
 struct BarItem {
     let element: AXUIElement
@@ -40,6 +180,13 @@ struct BarItem {
     let label: String
     let x: CGFloat
     let width: CGFloat
+    var window: StatusWindow?
+    var image: NSImage?
+    /// 真实菜单栏里的中心点(全局坐标,左上原点)
+    var center: CGPoint {
+        if let w = window { return CGPoint(x: w.bounds.midX, y: w.bounds.midY) }
+        return CGPoint(x: x + width / 2, y: 12)
+    }
     // 刘海屏:只有落在刘海右侧可视区(auxiliaryTopRightArea)里的才算看得见
     var onScreen: Bool {
         guard let screen = NSScreen.main else { return true }
@@ -51,8 +198,11 @@ struct BarItem {
 enum BarScanner {
     static func scan() -> [BarItem] {
         var out: [BarItem] = []
+        let wins = StatusWindows.all()
+        let capture = StatusWindows.hasPermission
         for app in NSWorkspace.shared.runningApplications
-        where app.processIdentifier != getpid() && app.activationPolicy != .prohibited {
+        where app.processIdentifier != getpid() && app.activationPolicy != .prohibited
+            && app.bundleIdentifier != "com.apple.controlcenter" {
             let ax = AXUIElementCreateApplication(app.processIdentifier)
             AXUIElementSetMessagingTimeout(ax, 0.25)
             var extras: CFTypeRef?
@@ -74,14 +224,132 @@ enum BarScanner {
                 let name = app.localizedName ?? "?"
                 var label = !title.isEmpty ? title : (!desc.isEmpty ? desc : name)
                 if label.count > 14 { label = String(label.prefix(13)) + "…" }
-                out.append(BarItem(element: it, app: app, label: label, x: pt.x, width: sz.width))
+                var item = BarItem(element: it, app: app, label: label, x: pt.x, width: sz.width)
+                // 同一进程里离 AX 位置最近的状态栏窗口就是它
+                item.window = wins.filter { $0.pid == app.processIdentifier }.min { abs($0.bounds.minX - pt.x) < abs($1.bounds.minX - pt.x) }
+                let k = IconCache.key(app, label, sz.width)
+                if capture, let w = item.window, item.onScreen, let img = StatusWindows.image(of: w) {
+                    item.image = img
+                    IconCache.put(k, img)
+                } else if let cached = IconCache.get(k) {
+                    cached.size = item.window?.bounds.size ?? CGSize(width: sz.width, height: 24)
+                    item.image = cached
+                }
+                out.append(item)
             }
         }
-        // 按菜单栏从右到左的顺序排,看不见的排在前面
-        return out.sorted { a, b in
-            if a.onScreen != b.onScreen { return !a.onScreen }
-            return a.x > b.x
+        let sorted = out.sorted { $0.center.x < $1.center.x }
+        Log.w("scan: \(sorted.count) 项, 截图权限=\(capture), 有图 \(sorted.filter { $0.image != nil }.count), 无图: " +
+              sorted.filter { $0.image == nil }.map { "\($0.label)@\(Int($0.center.x))" }.joined(separator: " "))
+        Log.w("scan order: " + sorted.map { "\($0.label)@\(Int($0.center.x))\($0.onScreen ? "" : "(挡)")" }.joined(separator: " "))
+        return sorted
+    }
+}
+
+
+// MARK: 面板里的「第二条菜单栏」
+final class ItemCell: NSView {
+    let item: BarItem
+    var hovered = false { didSet { needsDisplay = true } }
+    var pressed = false { didSet { needsDisplay = true } }
+    init(item: BarItem, height: CGFloat) {
+        self.item = item
+        let w = item.image != nil ? max(item.width, item.window?.bounds.width ?? item.width) : 30
+        super.init(frame: NSRect(x: 0, y: 0, width: w, height: height))
+        toolTip = item.app.localizedName
+        addTrackingArea(NSTrackingArea(rect: .zero, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect], owner: self, userInfo: nil))
+    }
+    required init?(coder: NSCoder) { nil }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func draw(_ dirtyRect: NSRect) {
+        if hovered || pressed {
+            let r = bounds.insetBy(dx: 1, dy: 4)
+            NSColor.labelColor.withAlphaComponent(pressed ? 0.28 : 0.16).setFill()
+            NSBezierPath(roundedRect: r, xRadius: 5, yRadius: 5).fill()
         }
+        if let img = item.image {
+            let size = img.size
+            let r = NSRect(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2, width: size.width, height: size.height)
+            img.draw(in: r)
+        } else if let icon = item.app.icon {
+            icon.draw(in: NSRect(x: (bounds.width - 18) / 2, y: (bounds.height - 18) / 2, width: 18, height: 18))
+        }
+        if !item.onScreen {   // 被挤出菜单栏的:底部一个小点
+            NSColor.systemOrange.withAlphaComponent(0.9).setFill()
+            NSBezierPath(ovalIn: NSRect(x: bounds.midX - 2, y: 2, width: 4, height: 4)).fill()
+        }
+    }
+}
+
+final class StripView: NSView {
+    var cells: [ItemCell] = []
+    var onClick: ((BarItem, Bool) -> Void)?           // (item, isRightClick)
+    var onReorder: ((BarItem, Int, [BarItem]) -> Void)?  // (被拖的项, 新下标, 拖前顺序)
+    private var dragging: ItemCell?
+    private var dragStart = NSPoint.zero
+    private var dragOffset: CGFloat = 0
+    private var didDrag = false
+    let rowH: CGFloat
+    let pad: CGFloat = 6
+
+    init(items: [BarItem], rowHeight: CGFloat) {
+        rowH = rowHeight
+        super.init(frame: .zero)
+        for it in items { let c = ItemCell(item: it, height: rowH); cells.append(c); addSubview(c) }
+        layoutCells(animated: false)
+    }
+    required init?(coder: NSCoder) { nil }
+    override var isFlipped: Bool { false }
+
+    var contentWidth: CGFloat { cells.reduce(0) { $0 + $1.frame.width } + pad * 2 }
+    func layoutCells(animated: Bool, skipping: ItemCell? = nil) {
+        var x = pad
+        for c in cells {
+            let f = NSRect(x: x, y: 0, width: c.frame.width, height: rowH)
+            if c !== skipping { if animated { c.animator().frame = f } else { c.frame = f } }
+            x += c.frame.width
+        }
+        frame.size = NSSize(width: x + pad, height: rowH)
+    }
+    private func cell(at p: NSPoint) -> ItemCell? { cells.first { $0.frame.contains(p) } }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard let c = cell(at: p) else { return }
+        dragging = c; dragStart = p; dragOffset = p.x - c.frame.minX; didDrag = false
+        c.pressed = true
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let c = dragging else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        if !didDrag && abs(p.x - dragStart.x) < 5 { return }
+        didDrag = true
+        c.frame.origin.x = p.x - dragOffset
+        c.superview?.addSubview(c, positioned: .above, relativeTo: nil)  // 拖的那个浮在最上面
+        // 按中心点重新排序
+        let sorted = cells.sorted { $0.frame.midX < $1.frame.midX }
+        if sorted.map({ ObjectIdentifier($0) }) != cells.map({ ObjectIdentifier($0) }) {
+            cells = sorted
+            layoutCells(animated: true, skipping: c)
+        }
+    }
+    override func mouseUp(with event: NSEvent) {
+        guard let c = dragging else { return }
+        c.pressed = false
+        dragging = nil
+        if didDrag {
+            let before = cells  // 注意:cells 已是新顺序;拖前顺序由调用方保存
+            layoutCells(animated: true)
+            if let idx = before.firstIndex(where: { $0 === c }) { onReorder?(c.item, idx, before.map { $0.item }) }
+        } else {
+            onClick?(c.item, false)
+        }
+    }
+    override func rightMouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        guard let c = cell(at: p) else { return }
+        onClick?(c.item, true)
     }
 }
 
@@ -176,13 +444,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSLog("AX trusted=%d", AXIsProcessTrusted() ? 1 : 0)
             NSApp.terminate(nil)
         }
-        if let i = CommandLine.arguments.firstIndex(of: "--press"), i + 1 < CommandLine.arguments.count {   // 调试:按某个项,看菜单弹哪
+        if let i = CommandLine.arguments.firstIndex(of: "--capture"), i + 1 < CommandLine.arguments.count {   // 调试:截某项图像存 PNG
+            let name = CommandLine.arguments[i + 1]
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                NSLog("capture permission=%d", StatusWindows.hasPermission ? 1 : 0)
+                if !StatusWindows.hasPermission { StatusWindows.requestPermission() }
+                for it in BarScanner.scan() where name == "all" || (it.app.localizedName ?? "") == name {
+                    let w = it.window
+                    NSLog("%@ ax.x=%.0f win=%@ img=%@", it.label, it.x, w.map { NSStringFromRect($0.bounds) } ?? "nil", it.image.map { NSStringFromSize($0.size) } ?? "nil")
+                    if let img = it.image, let tiff = img.tiffRepresentation, let rep = NSBitmapImageRep(data: tiff), let png = rep.representation(using: .png, properties: [:]) {
+                        let out = "/tmp/screenoff-\(it.app.localizedName ?? "x").png".replacingOccurrences(of: " ", with: "_")
+                        try? png.write(to: URL(fileURLWithPath: out))
+                        NSLog("saved %@ lum=%.2f", out, StatusWindows.luminance(img) ?? -1)
+                    }
+                }
+                NSApp.terminate(nil)
+            }
+            return
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--drag"), i + 2 < CommandLine.arguments.count {   // 调试:把某项 ⌘拖到某 x
+            let name = CommandLine.arguments[i + 1], tx = CGFloat(Double(CommandLine.arguments[i + 2]) ?? 0)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                guard let it = BarScanner.scan().first(where: { ($0.app.localizedName ?? "") == name }) else { NSLog("not found"); NSApp.terminate(nil); return }
+                NSLog("before: %@ center=%@", it.label, NSStringFromPoint(it.center))
+                Synth.cmdDrag(from: it.center, to: CGPoint(x: tx, y: it.center.y))
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                    if let after = BarScanner.scan().first(where: { ($0.app.localizedName ?? "") == name }) { NSLog("after: center=%@", NSStringFromPoint(after.center)) }
+                    NSApp.terminate(nil)
+                }
+            }
+            return
+        }
+        if let i = CommandLine.arguments.firstIndex(of: "--press"), i + 1 < CommandLine.arguments.count {   // 调试:按某个项,看菜单弹哪(--click = 合成鼠标点击, --right = 右键)
             let name = CommandLine.arguments[i + 1]
             let area = NSScreen.main?.auxiliaryTopRightArea ?? .zero
             NSLog("topRightArea=%@", NSStringFromRect(area))
+            usleep(1_000_000)
             guard let it = BarScanner.scan().first(where: { ($0.app.localizedName ?? "") == name || $0.label == name }) else { NSLog("not found"); NSApp.terminate(nil); return }
-            let r = AXUIElementPerformAction(it.element, kAXPressAction as CFString)
-            NSLog("AXPress %@ x=%.0f -> %d", it.label, it.x, r.rawValue)
+            if CommandLine.arguments.contains("--click") {
+                Synth.click(at: it.center, right: CommandLine.arguments.contains("--right"))
+                NSLog("Click %@ at %@", it.label, NSStringFromPoint(it.center))
+            } else {
+                let r = AXUIElementPerformAction(it.element, kAXPressAction as CFString)
+                NSLog("AXPress %@ x=%.0f -> %d", it.label, it.x, r.rawValue)
+            }
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
                 let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly], kCGNullWindowID) as! [[String: Any]]
                 for w in list where (w[kCGWindowOwnerName as String] as? String) == (it.app.localizedName ?? "") {
@@ -235,6 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showPanel(content: permissionView())
             return
         }
+        Log.w("panel open")
         items = BarScanner.scan()
         showPanel(content: itemsView())
     }
@@ -260,62 +566,140 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")!)
     }
 
+    private var originalOrder: [BarItem] = []
+
     private func itemsView() -> NSView {
-        let perRow = 8
-        let cellW: CGFloat = 78, cellH: CGFloat = 58
-        let grid = NSStackView()
-        grid.orientation = .vertical
-        grid.alignment = .leading
-        grid.spacing = 4
-        grid.edgeInsets = NSEdgeInsets(top: 10, left: 10, bottom: 10, right: 10)
+        let box = NSStackView()
+        box.orientation = .vertical
+        box.alignment = .leading
+        box.spacing = 4
+        box.edgeInsets = NSEdgeInsets(top: 6, left: 6, bottom: 6, right: 6)
         if items.isEmpty {
-            let t = NSTextField(labelWithString: "没有找到状态栏项")
-            grid.addArrangedSubview(t)
-            return grid
+            box.addArrangedSubview(NSTextField(labelWithString: "没有找到状态栏项"))
+            return box
         }
-        var row: NSStackView?
-        for (i, it) in items.enumerated() {
-            if i % perRow == 0 {
-                row = NSStackView(); row!.orientation = .horizontal; row!.spacing = 4
-                grid.addArrangedSubview(row!)
-            }
-            let b = NSButton(title: it.label, target: self, action: #selector(itemClicked(_:)))
-            b.tag = i
-            b.image = it.app.icon
-            b.image?.size = NSSize(width: 24, height: 24)
-            b.imagePosition = .imageAbove
-            b.imageScaling = .scaleProportionallyDown
-            b.isBordered = false
-            b.font = .systemFont(ofSize: 10)
-            b.lineBreakMode = .byTruncatingTail
-            b.toolTip = (it.app.localizedName ?? "") + (it.onScreen ? "" : "（当前被挤出菜单栏）")
-            b.alphaValue = it.onScreen ? 0.55 : 1.0
-            b.translatesAutoresizingMaskIntoConstraints = false
-            b.widthAnchor.constraint(equalToConstant: cellW).isActive = true
-            b.heightAnchor.constraint(equalToConstant: cellH).isActive = true
-            row!.addArrangedSubview(b)
+        let rowH = items.compactMap { $0.window?.bounds.height }.max() ?? 24
+        let strip = StripView(items: items, rowHeight: rowH)
+        strip.translatesAutoresizingMaskIntoConstraints = false
+        strip.widthAnchor.constraint(equalToConstant: strip.contentWidth).isActive = true
+        strip.heightAnchor.constraint(equalToConstant: rowH).isActive = true
+        originalOrder = items
+        strip.onClick = { [weak self] it, right in self?.activate(it, right: right) }
+        strip.onReorder = { [weak self] it, idx, order in self?.reorder(it, to: idx, newOrder: order) }
+        box.addArrangedSubview(strip)
+
+        var tip = "左键 / 右键 / 拖动 = 和菜单栏里一样。橙点 = 被刘海挡住的：只能左键，不能右键和拖动。"
+        if !StatusWindows.hasPermission {
+            tip = "开启「屏幕录制」权限后可显示图标原样；现在显示的是 app 图标。"
+            let b = NSButton(title: "去开启屏幕录制权限", target: self, action: #selector(requestCapture))
+            b.bezelStyle = .rounded; b.controlSize = .small
+            box.addArrangedSubview(b)
         }
-        let hint = NSTextField(labelWithString: "亮的 = 被挤出菜单栏的；暗的 = 菜单栏里本来就能看见的。点一下即打开。")
+        let hint = NSTextField(labelWithString: tip)
         hint.font = .systemFont(ofSize: 10)
         hint.textColor = .tertiaryLabelColor
-        grid.addArrangedSubview(hint)
-        return grid
+        box.addArrangedSubview(hint)
+        return box
     }
 
-    @objc private func itemClicked(_ sender: NSButton) {
-        guard sender.tag < items.count else { return }
-        let it = items[sender.tag]
+    @objc private func requestCapture() {
+        StatusWindows.requestPermission()
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")!)
+        closePanel()
+        // 屏幕录制权限要重启 app 才生效
+        let alert = NSAlert()
+        alert.messageText = "开启权限后需要重新启动本 app"
+        alert.informativeText = "在系统设置里打开「关屏不待机」的屏幕录制开关，然后点「重新启动」。"
+        alert.addButton(withTitle: "重新启动")
+        alert.addButton(withTitle: "稍后")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertFirstButtonReturn { relaunch() }
+    }
+
+    private func relaunch() {
+        let path = Bundle.main.bundlePath
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/bin/sh")
+        p.arguments = ["-c", "sleep 1; /usr/bin/open \"\(path)\" --args --background"]
+        try? p.run()
+        NSApp.terminate(nil)
+    }
+
+    /// 可见项:在真实菜单栏位置发合成鼠标事件(左/右键都行);被刘海挡住的项:只能用辅助功能「按」(左键)
+    private func activate(_ it: BarItem, right: Bool) {
         closePanel()
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            let r = AXUIElementPerformAction(it.element, kAXPressAction as CFString)
-            NSLog("AXPress %@ -> %d", it.label, r.rawValue)
+            if it.onScreen, it.window != nil {
+                let before = NSEvent.mouseLocation
+                Synth.click(at: it.center, right: right)
+                Log.w("click \(right ? "右" : "左") \(it.label) at \(Int(it.center.x)),\(Int(it.center.y)) postAccess=\(CGPreflightPostEventAccess()) mouseBefore=\(Int(before.x)),\(Int(before.y)) mouseAfterMove=\(Synth.lastSeen)")
+            } else if !right {
+                let r = AXUIElementPerformAction(it.element, kAXPressAction as CFString)
+                Log.w("axpress(挡) \(it.label) -> \(r.rawValue)")
+            } else {
+                Log.w("右键 \(it.label) 被刘海挡住,不支持")
+                self.flash("「\(it.label)」被刘海挡住，只支持左键")
+            }
+        }
+    }
+
+    /// 面板下方一闪而过的提示
+    private func flash(_ text: String) {
+        let t = NSTextField(labelWithString: text)
+        t.font = .systemFont(ofSize: 12); t.textColor = .white
+        t.backgroundColor = NSColor.black.withAlphaComponent(0.75); t.drawsBackground = true
+        t.sizeToFit()
+        let pad: CGFloat = 12
+        let w = NSPanel(contentRect: NSRect(x: 0, y: 0, width: t.frame.width + pad * 2, height: t.frame.height + pad), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        w.isReleasedWhenClosed = false
+        w.backgroundColor = NSColor.black.withAlphaComponent(0.75); w.isOpaque = false; w.hasShadow = true
+        w.level = .popUpMenu
+        t.frame.origin = NSPoint(x: pad, y: pad / 2)
+        w.contentView?.addSubview(t)
+        if let sc = NSScreen.main { w.setFrameOrigin(NSPoint(x: sc.frame.maxX - w.frame.width - 12, y: sc.visibleFrame.maxY - w.frame.height - 12)) }
+        w.orderFrontRegardless()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { w.orderOut(nil) }
+    }
+
+    /// 面板里拖完 → 在真实菜单栏做 ⌘拖动
+    private func reorder(_ it: BarItem, to idx: Int, newOrder: [BarItem]) {
+        let others = newOrder.filter { $0.window?.id != it.window?.id }
+        let leftNeighbor = idx > 0 ? others[idx - 1] : nil          // 新位置左边那个
+        let rightNeighbor = idx < others.count ? others[idx] : nil   // 新位置右边那个
+        var targetX: CGFloat
+        if let l = leftNeighbor?.window?.bounds, let r = rightNeighbor?.window?.bounds {
+            targetX = (l.maxX + r.minX) / 2
+        } else if let r = rightNeighbor?.window?.bounds {
+            targetX = r.minX - it.width / 2 - 2
+        } else if let l = leftNeighbor?.window?.bounds {
+            targetX = l.maxX + it.width / 2 + 2
+        } else { return }
+        // 目标在被拖项右边时,它自己让出的宽度要扣掉
+        if targetX > it.center.x { targetX -= it.width }
+        let visMinX = NSScreen.main?.auxiliaryTopRightArea?.minX ?? 0
+        guard it.onScreen, targetX - it.width / 2 >= visMinX else {
+            Log.w("drag \(it.label) 拒绝:源可见=\(it.onScreen) 目标x=\(Int(targetX)) 可见区起点=\(Int(visMinX))")
+            flash(it.onScreen ? "目标位置在刘海底下，放不进去" : "「\(it.label)」被刘海挡住，拖不动")
+            items = BarScanner.scan(); showPanel(content: itemsView())
+            return
+        }
+        closePanel()
+        let from = it.center
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            Synth.cmdDrag(from: from, to: CGPoint(x: targetX, y: from.y))
+            Log.w("drag \(it.label) from \(Int(from.x)) to \(Int(targetX)) (左邻 \(leftNeighbor?.label ?? "-") 右邻 \(rightNeighbor?.label ?? "-"))")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                guard let self else { return }
+                self.items = BarScanner.scan()
+                self.showPanel(content: self.itemsView())
+            }
         }
     }
 
     private func showPanel(content: NSView) {
         closePanel()
         let effect = NSVisualEffectView()
-        effect.material = .popover
+        effect.material = .menu
         effect.blendingMode = .behindWindow
         effect.state = .active
         effect.wantsLayer = true
@@ -331,6 +715,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         let size = content.fittingSize
         let p = BarPanel(contentRect: NSRect(origin: .zero, size: size), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        if let img = items.first(where: { $0.image != nil })?.image, let lum = StatusWindows.luminance(img) {
+            p.appearance = NSAppearance(named: lum > 0.5 ? .darkAqua : .aqua)
+        }
         p.contentView = effect
         p.isOpaque = false
         p.backgroundColor = .clear
